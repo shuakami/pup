@@ -431,14 +431,18 @@ async function scanAll(kernel) {
   const cdp = await kernel.cdp();
   await cdp.enable('Page');
 
-  // Scroll to top
+  // Scroll to top (best effort, don't fail if timeout)
   const vp = await getViewportSize(kernel);
   const x = Math.floor((vp.w || 1) / 2);
   const y = Math.floor((vp.h || 1) / 2);
 
-  for (let i = 0; i < 10; i++) {
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY: -2000, pointerType: 'mouse' }, { timeoutMs: 3000, label: 'scrollTop' });
-    await sleep(30);
+  try {
+    for (let i = 0; i < 10; i++) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY: -2000, pointerType: 'mouse' }, { timeoutMs: 3000, label: 'scrollTop' });
+      await sleep(30);
+    }
+  } catch {
+    // Scroll to top failed, continue anyway
   }
   await sleep(250);
 
@@ -460,22 +464,31 @@ async function scanAll(kernel) {
     if (all.length === before) noNew += 1;
     else noNew = 0;
 
-    // scroll down
-    await cdp.send('Input.dispatchMouseEvent', {
-      type: 'mouseWheel',
-      x, y,
-      deltaX: 0,
-      deltaY: (vp.h || 800) * 0.7,
-      pointerType: 'mouse'
-    }, { timeoutMs: 3000, label: 'scrollDown' });
+    // scroll down (best effort)
+    try {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x, y,
+        deltaX: 0,
+        deltaY: (vp.h || 800) * 0.7,
+        pointerType: 'mouse'
+      }, { timeoutMs: 3000, label: 'scrollDown' });
+    } catch {
+      // Scroll failed, stop scanning
+      break;
+    }
 
     await sleep(250);
   }
 
-  // Return to top (best effort)
-  for (let i = 0; i < 10; i++) {
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY: -2000, pointerType: 'mouse' }, { timeoutMs: 3000, label: 'scrollTop2' });
-    await sleep(30);
+  // Return to top (best effort, don't fail if timeout)
+  try {
+    for (let i = 0; i < 10; i++) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY: -2000, pointerType: 'mouse' }, { timeoutMs: 3000, label: 'scrollTop2' });
+      await sleep(30);
+    }
+  } catch {
+    // Scroll to top failed, continue anyway
   }
 
   const page = await kernel.page();
