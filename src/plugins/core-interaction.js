@@ -22,6 +22,34 @@ const meta = {
   ]
 };
 
+/**
+ * 规范化 URL 用于比较（忽略末尾斜杠差异）
+ * 例如: /video/BV123 和 /video/BV123/ 应该被视为相同
+ */
+function normalizeUrlForCompare(url) {
+  if (!url) return '';
+  // 移除末尾斜杠（但保留根路径的斜杠）
+  try {
+    const u = new URL(url);
+    // 只处理路径部分的末尾斜杠，保留查询参数和 hash
+    if (u.pathname.length > 1 && u.pathname.endsWith('/')) {
+      u.pathname = u.pathname.slice(0, -1);
+    }
+    return u.href;
+  } catch {
+    // 如果 URL 解析失败，简单移除末尾斜杠
+    return url.replace(/\/+$/, '') || url;
+  }
+}
+
+/**
+ * 检查 URL 是否已在重定向链中（忽略末尾斜杠差异）
+ */
+function isUrlInChain(chain, url) {
+  const normalizedUrl = normalizeUrlForCompare(url);
+  return chain.some(u => normalizeUrlForCompare(u) === normalizedUrl);
+}
+
 function scanner(kernel) {
   const svc = kernel.getService('scanner');
   if (!svc) throw new Error('Scanner service missing: core-scanner not loaded');
@@ -487,6 +515,68 @@ async function clickById(kernel, id, opts = {}) {
   // Get URL before click from the page we're about to click on
   const pageBefore = await kernel.page();
   const urlBefore = toStr(pageBefore.url());
+  
+  // 设置 CDP Network 监听来追踪重定向链
+  const cdp = await kernel.cdp();
+  const redirectChain = [];
+  let mainFrameId = null;
+  let mainRequestId = null;
+  
+  await cdp.enable('Network');
+  await cdp.enable('Page');
+  
+  const requestHandler = (params) => {
+    // 只追踪主框架的文档请求
+    if (params.type === 'Document' && params.requestId) {
+      const reqUrl = params.request && params.request.url;
+      if (reqUrl && 
+          (reqUrl.startsWith('http://') || reqUrl.startsWith('https://')) &&
+          !reqUrl.includes('browser.pipe.aria.microsoft.com') &&
+          !reqUrl.includes('chrome-extension://') &&
+          !reqUrl.includes('edge://')) {
+        
+        if (!mainFrameId) {
+          mainFrameId = params.frameId;
+          mainRequestId = params.requestId;
+        }
+        
+        // 只追踪主请求链（使用 isUrlInChain 忽略末尾斜杠差异）
+        if (params.requestId === mainRequestId || 
+            (params.redirectResponse && redirectChain.length > 0)) {
+          if (!isUrlInChain(redirectChain, reqUrl)) {
+            redirectChain.push(reqUrl);
+          }
+          mainRequestId = params.requestId;
+        }
+      }
+    }
+  };
+  
+  const redirectHandler = (params) => {
+    if (params.redirectResponse && params.requestId === mainRequestId) {
+      const redirUrl = params.redirectResponse.url;
+      const newUrl = params.request && params.request.url;
+      
+      // 使用 isUrlInChain 忽略末尾斜杠差异
+      if (redirUrl && !isUrlInChain(redirectChain, redirUrl) &&
+          !redirUrl.includes('browser.pipe.aria.microsoft.com')) {
+        if (redirectChain.length === 0 || normalizeUrlForCompare(redirectChain[redirectChain.length - 1]) !== normalizeUrlForCompare(redirUrl)) {
+          redirectChain.push(redirUrl);
+        }
+      }
+      
+      if (newUrl && !isUrlInChain(redirectChain, newUrl) &&
+          !newUrl.includes('browser.pipe.aria.microsoft.com') &&
+          (newUrl.startsWith('http://') || newUrl.startsWith('https://'))) {
+        redirectChain.push(newUrl);
+      }
+      
+      mainRequestId = params.requestId;
+    }
+  };
+  
+  cdp.on('Network.requestWillBeSent', requestHandler);
+  cdp.on('Network.requestWillBeSent', redirectHandler);
 
   const attempt = async () => {
     // 如果使用 JS 点击，直接调用 element.click()，跳过坐标计算
@@ -674,8 +764,9 @@ async function clickById(kernel, id, opts = {}) {
   let newTabOpened = false;
   let validPagesAfter = [];
   
-  for (let i = 0; i < 3; i++) {
-    await sleep(300);
+  // 增加检测次数和等待时间
+  for (let i = 0; i < 5; i++) {
+    await sleep(250);
     
     // 检查当前页面 URL
     const currentPage = await kernel.page();
@@ -696,6 +787,8 @@ async function clickById(kernel, id, opts = {}) {
     
     if (validPagesAfter.length > countBefore) {
       newTabOpened = true;
+      // 等待新标签页加载一点内容
+      await sleep(200);
       break;
     }
   }
@@ -709,16 +802,149 @@ async function clickById(kernel, id, opts = {}) {
 
   // 如果原页面没有导航，检查是否打开了新标签页
   if (newTabOpened) {
-    // 找到新打开的标签页
-    const newPage = validPagesAfter.find(p => {
-      const u = toStr(p.url());
-      return !pagesBefore.some(pb => toStr(pb.url()) === u);
-    }) || validPagesAfter[validPagesAfter.length - 1];
+    // 重新获取页面列表，确保获取最新状态
+    const pagesNow = await browser.pages();
+    const validPagesNow = pagesNow.filter(p => {
+      try {
+        if (!p || p.isClosed()) return false;
+        const u = toStr(p.url());
+        return !u.startsWith('chrome-extension://') && !u.startsWith('devtools://');
+      } catch { return false; }
+    });
+    
+    // 找到新打开的标签页（不在 pagesBefore 中的）
+    let newPage = null;
+    for (const p of validPagesNow) {
+      const pUrl = toStr(p.url());
+      // 检查这个页面是否是新的（URL 不在之前的列表中，或者是最后一个页面）
+      const isNew = !pagesBefore.some(pb => {
+        try {
+          return pb === p || toStr(pb.url()) === pUrl;
+        } catch { return false; }
+      });
+      if (isNew && pUrl !== 'about:blank') {
+        newPage = p;
+        break;
+      }
+    }
+    
+    // 如果没找到明确的新页面，使用最后一个页面
+    if (!newPage && validPagesNow.length > countBefore) {
+      newPage = validPagesNow[validPagesNow.length - 1];
+    }
     
     if (newPage) {
       res.newTab = true;
       res.newUrl = toStr(newPage.url());
       await kernel.resetPageTo(newPage);
+      
+      // 新标签页需要重新设置 CDP 监听
+      const newCdp = await kernel.cdp({ forceNew: true });
+      await newCdp.enable('Network');
+    }
+  }
+  
+  // 清理 CDP 监听器
+  try {
+    cdp.off('Network.requestWillBeSent', requestHandler);
+    cdp.off('Network.requestWillBeSent', redirectHandler);
+  } catch {}
+
+  // 如果有导航或新标签页，检测 404 和跳转链
+  if (res.navigated || res.newTab) {
+    const currentPage = await kernel.page();
+    const finalUrl = toStr(currentPage.url());
+    
+    // 确保最终 URL 在链中（使用 isUrlInChain 忽略末尾斜杠差异）
+    if (finalUrl && !isUrlInChain(redirectChain, finalUrl)) {
+      redirectChain.push(finalUrl);
+    }
+    
+    // 等待页面稳定，检测可能的 JS 跳转
+    let lastUrl = finalUrl;
+    for (let hop = 0; hop < 2; hop++) {
+      await sleep(400);
+      const nowUrl = toStr(currentPage.url());
+      // 使用 normalizeUrlForCompare 比较，忽略末尾斜杠差异
+      if (normalizeUrlForCompare(nowUrl) !== normalizeUrlForCompare(lastUrl) && nowUrl !== 'about:blank') {
+        if (!isUrlInChain(redirectChain, nowUrl)) {
+          redirectChain.push(nowUrl);
+        }
+        lastUrl = nowUrl;
+      } else {
+        break;
+      }
+    }
+    
+    // 如果有多次跳转，记录跳转链
+    if (redirectChain.length > 1) {
+      res.redirectChain = redirectChain;
+      res.finalUrl = redirectChain[redirectChain.length - 1];
+      res.hopCount = redirectChain.length;
+    } else if (redirectChain.length === 1) {
+      res.finalUrl = redirectChain[0];
+    }
+    
+    // 检测 404 页面
+    try {
+      let title = '';
+      try { title = await currentPage.title(); } catch {}
+      const lowerTitle = (title || '').toLowerCase();
+      const currentUrl = toStr(currentPage.url());
+      
+      // 检测 404 关键词
+      const is404ByTitle = lowerTitle.includes('404') || 
+                           lowerTitle.includes('not found') || 
+                           lowerTitle.includes('去哪了') || 
+                           lowerTitle.includes('error') ||
+                           lowerTitle.includes('页面不存在') ||
+                           lowerTitle.includes('does not exist');
+      
+      // 检测 URL 中的错误标识
+      const is404ByUrl = currentUrl.includes('errorpage') || 
+                         currentUrl.includes('/404') ||
+                         currentUrl.includes('error=') ||
+                         currentUrl.includes('notfound');
+      
+      // 检测是否跳转到首页（可能是 404 重定向）
+      let redirectedToHome = false;
+      try {
+        const originalUrl = res.newUrl || urlAfterClick;
+        if (originalUrl && currentUrl) {
+          const origPath = new URL(originalUrl).pathname;
+          const currPath = new URL(currentUrl).pathname;
+          const origHost = new URL(originalUrl).hostname;
+          const currHost = new URL(currentUrl).hostname;
+          
+          // 如果原始路径不是首页，但最终跳转到了首页
+          if (origPath !== '/' && origPath !== '' && (currPath === '/' || currPath === '')) {
+            redirectedToHome = true;
+          }
+          // 如果域名变了
+          if (origHost !== currHost) {
+            res.domainChanged = true;
+            res.originalDomain = origHost;
+            res.finalDomain = currHost;
+          }
+        }
+      } catch {}
+      
+      if (is404ByTitle || is404ByUrl) {
+        res.is404 = true;
+        res.errorTitle = title;
+      }
+      
+      if (redirectedToHome && !res.is404) {
+        res.redirectedToHome = true;
+        res.warning = 'Page redirected to homepage (possible 404)';
+      }
+      
+      // 更新最终 URL
+      res.finalUrl = currentUrl;
+      res.finalTitle = title;
+      
+    } catch {
+      // 检测失败，忽略
     }
   }
 

@@ -234,6 +234,10 @@ const INJECTOR_SCRIPT = `(() => {
 
     function extractLabel(el) {
       try {
+        // aria-label takes highest priority (most semantic)
+        const aria = el.getAttribute && el.getAttribute('aria-label');
+        if (aria && cleanText(aria)) return cleanText(aria);
+
         // prefer element-provided text
         let t = cleanText(el.innerText || '');
         if (t) return t;
@@ -241,10 +245,6 @@ const INJECTOR_SCRIPT = `(() => {
         // textContent as fallback (includes hidden text)
         t = cleanText(el.textContent || '');
         if (t) return t;
-
-        // aria-label / title / placeholder / alt / value
-        const aria = el.getAttribute && el.getAttribute('aria-label');
-        if (aria && cleanText(aria)) return cleanText(aria);
 
         const title = el.getAttribute && el.getAttribute('title');
         if (title && cleanText(title)) return cleanText(title);

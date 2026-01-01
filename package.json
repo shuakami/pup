@@ -1,11 +1,10 @@
 {
-  "name": "neural-link",
+  "name": "@sdjz/pup",
   "version": "1.0.0",
-  "private": true,
-  "description": "NEURAL-LINK: persistent, fault-tolerant browser interface for text-only agents (JSON-lines RPC).",
+  "description": "Browser automation for AI agents - AXTree scanning, stealth mode, plugin architecture",
   "main": "src/index.js",
   "bin": {
-    "neural-link": "src/index.js"
+    "pup": "src/index.js"
   },
   "type": "commonjs",
   "scripts": {
@@ -14,6 +13,18 @@
   "engines": {
     "node": ">=18.0.0"
   },
+  "keywords": [
+    "browser",
+    "automation",
+    "puppeteer",
+    "ai",
+    "agent",
+    "llm",
+    "devtools",
+    "cdp"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "axios": "^1.7.8",
     "puppeteer-core": "^24.2.0",

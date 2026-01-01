@@ -11,6 +11,7 @@
 
 const { toStr } = require('../utils/strings');
 const { withTimeout, sleep } = require('../utils/async');
+const { pMap } = require('../utils/promise-pool');
 
 const meta = {
   name: 'core-scanner',
@@ -206,20 +207,31 @@ async function scanViewport(kernel) {
     unique.push(c);
   }
 
-  // For each candidate, fetch box model to check viewport intersection
-  const elements = [];
-  const truncated = unique.length > maxElements;
 
-  for (let i = 0; i < unique.length; i++) {
-    if (elements.length >= maxElements) break;
+// For each candidate, fetch box model to check viewport intersection.
+// 性能优化：并发拉取 BoxModel，收集所有元素后按 y 坐标排序
+const rawElements = [];
+const truncated = unique.length > maxElements;
 
-    const c = unique[i];
-    let model = null;
+const CONCURRENCY = 8; // conservative; do NOT change timeouts/design
+for (let offset = 0; offset < unique.length && rawElements.length < maxElements; offset += CONCURRENCY) {
+  const batch = unique.slice(offset, offset + CONCURRENCY);
+
+  const batchModels = await Promise.all(batch.map(async (c) => {
     try {
-      model = await domGetBoxModel(cdp, c.backendDOMNodeId);
+      const model = await domGetBoxModel(cdp, c.backendDOMNodeId);
+      return { c, model };
     } catch {
-      continue;
+      return null;
     }
+  }));
+
+  for (const item of batchModels) {
+    if (!item || !item.model) continue;
+    if (rawElements.length >= maxElements) break;
+
+    const c = item.c;
+    const model = item.model;
 
     // prefer border quad
     const quad = model.border || model.content;
@@ -230,8 +242,7 @@ async function scanViewport(kernel) {
     const pt = computeClickablePointFromQuad(quad, viewportW, viewportH);
     if (!pt) continue;
 
-    elements.push({
-      id: elements.length + 1,
+    rawElements.push({
       type: c.role || 'element',
       role: c.role || null,
       text: c.text || '',
@@ -245,6 +256,75 @@ async function scanViewport(kernel) {
       backendDOMNodeId: c.backendDOMNodeId
     });
   }
+}
+
+// 按视觉位置排序，优先显示视口内完全可见的元素
+// 1. 部分超出视口的元素（右边缘超出）排在后面
+// 2. 按 y 坐标排序（页面顶部优先）
+// 3. y 相同时按 x 排序（从左到右）
+rawElements.sort((a, b) => {
+  // 元素右边缘超出视口的排在后面
+  const aOutside = (a.x + a.w / 2) > viewportW;
+  const bOutside = (b.x + b.w / 2) > viewportW;
+  if (aOutside !== bOutside) return aOutside ? 1 : -1;
+  
+  // 按 y 坐标排序
+  if (a.y !== b.y) return a.y - b.y;
+  // y 相同时按 x 排序
+  return a.x - b.x;
+});
+
+// 标记同一行的小元素，用于显示时紧凑输出
+// 每个元素保留独立 id，不合并
+const ROW_THRESHOLD = 10; // y 坐标差值小于此值视为同一行
+const MIN_ROW_ELEMENTS = 4; // 至少 4 个元素才标记为行
+const MAX_ELEMENT_WIDTH = 150; // 宽度小于此值的元素才参与行标记
+
+const elements = [];
+let rowId = 0;
+let i = 0;
+while (i < rawElements.length) {
+  const current = rawElements[i];
+  
+  // 检查是否可以形成行
+  if (current.w < MAX_ELEMENT_WIDTH) {
+    // 收集同一行的小元素
+    const rowStart = i;
+    let j = i + 1;
+    while (j < rawElements.length) {
+      const next = rawElements[j];
+      if (Math.abs(next.y - current.y) < ROW_THRESHOLD && next.w < MAX_ELEMENT_WIDTH) {
+        j++;
+      } else {
+        break;
+      }
+    }
+    
+    const rowLength = j - rowStart;
+    // 如果同一行有足够多的小元素，标记它们
+    if (rowLength >= MIN_ROW_ELEMENTS) {
+      rowId++;
+      for (let k = rowStart; k < j; k++) {
+        elements.push({
+          ...rawElements[k],
+          id: elements.length + 1,
+          _row: rowId,
+          _rowPos: k - rowStart,
+          _rowLen: rowLength
+        });
+      }
+      i = j;
+      continue;
+    }
+  }
+  
+  // 普通元素
+  elements.push({
+    ...current,
+    id: elements.length + 1
+  });
+  i++;
+}
 
   const page = await kernel.page();
   let title = '';
@@ -272,46 +352,38 @@ async function enhanceWithDOM(kernel, elements) {
   const cdp = await kernel.cdp();
   await cdp.enable('DOM');
   await cdp.enable('Runtime');
-  
-  const enhanced = [];
-  
-  for (const el of elements) {
+
+  const list = Array.isArray(elements) ? elements : [];
+  const CONCURRENCY = 3; // conservative; avoids overloading Runtime/DOM
+
+  const enhanced = await pMap(list, async (el) => {
     // 如果已经有足够的文本，跳过
-    if (el.text && el.text.length > 30) {
-      enhanced.push(el);
-      continue;
-    }
-    
+    if (el.text && el.text.length > 30) return el;
+
     // 只增强 listitem 和 generic 类型
-    if (el.type !== 'listitem' && el.type !== 'generic') {
-      enhanced.push(el);
-      continue;
-    }
-    
+    if (el.type !== 'listitem' && el.type !== 'generic') return el;
+
     try {
       // 使用 backendDOMNodeId 精确定位元素
-      const resolved = await cdp.send('DOM.resolveNode', { 
-        backendNodeId: el.backendDOMNodeId 
+      const resolved = await cdp.send('DOM.resolveNode', {
+        backendNodeId: el.backendDOMNodeId
       }, { timeoutMs: 1500, label: 'DOM.resolveNode(enhance)' });
-      
-      if (!resolved || !resolved.object || !resolved.object.objectId) {
-        enhanced.push(el);
-        continue;
-      }
-      
+
+      if (!resolved || !resolved.object || !resolved.object.objectId) return el;
+
       const result = await cdp.send('Runtime.callFunctionOn', {
         objectId: resolved.object.objectId,
         functionDeclaration: `function() {
           try {
             const el = this;
             let text = '';
-            
+
             // 查找产品标题
             const titleEl = el.querySelector('h2, h2 a, [data-cy="title-recipe"], .a-text-normal, .a-link-normal .a-text-normal');
             if (titleEl) {
               text = (titleEl.innerText || titleEl.textContent || '').trim();
             }
-            
+
             // 查找价格
             const priceEl = el.querySelector('.a-price .a-offscreen, .a-price-whole');
             if (priceEl) {
@@ -320,7 +392,7 @@ async function enhanceWithDOM(kernel, elements) {
                 text += text ? ' | ' + price : price;
               }
             }
-            
+
             // 查找评分
             const ratingEl = el.querySelector('[aria-label*="out of 5"], .a-icon-alt');
             if (ratingEl) {
@@ -330,12 +402,12 @@ async function enhanceWithDOM(kernel, elements) {
                 text += text ? ' | ★' + match[1] : '★' + match[1];
               }
             }
-            
+
             // 如果没有找到特定内容，使用 innerText 的前 80 字符
             if (!text) {
               text = (el.innerText || '').substring(0, 80).replace(/\\n+/g, ' ').trim();
             }
-            
+
             return { ok: true, text: text.substring(0, 100) };
           } catch (e) {
             return { ok: false, error: String(e) };
@@ -343,18 +415,15 @@ async function enhanceWithDOM(kernel, elements) {
         }`,
         returnByValue: true
       }, { timeoutMs: 2000, label: 'enhance(callFunctionOn)' });
-      
+
       const v = result && result.result ? result.result.value : null;
-      if (v && v.ok && v.text) {
-        enhanced.push({ ...el, text: v.text });
-      } else {
-        enhanced.push(el);
-      }
+      if (v && v.ok && v.text) return { ...el, text: v.text };
+      return el;
     } catch {
-      enhanced.push(el);
+      return el;
     }
-  }
-  
+  }, { concurrency: CONCURRENCY, stopOnError: false });
+
   return enhanced;
 }
 
@@ -583,7 +652,10 @@ async function onLoad(kernel) {
       const limit = limitIdx >= 0 ? parseInt(argv[limitIdx + 1], 10) : 0;
       
       // 过滤掉 --limit 和它的值
-      const textParts = argv.filter((a, i) => i !== limitIdx && i !== limitIdx + 1);
+      const textParts = argv.filter((a, i) => {
+        if (limitIdx < 0) return true; // 没有 --limit，保留所有
+        return i !== limitIdx && i !== limitIdx + 1;
+      });
       const q = sanitizeText(textParts.join(' '));
       if (!q) throw new Error('FIND: missing text');
       

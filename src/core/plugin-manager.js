@@ -47,10 +47,36 @@ class PluginManager {
   }
 
   /**
-   * Load all plugins.
+   * Load all plugins from the main plugins directory.
    */
   async loadAll() {
     const files = this.scan();
+    for (const f of files) {
+      await this.loadByPath(f);
+    }
+  }
+
+  /**
+   * Load plugins from an external directory.
+   * @param {string} dir
+   */
+  async loadFromDir(dir) {
+    const absDir = path.resolve(String(dir || ''));
+    if (!absDir) return;
+    
+    let entries = [];
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    const files = entries
+      .filter((e) => e.isFile() && e.name.endsWith('.js'))
+      .map((e) => path.join(absDir, e.name));
+
+    files.sort((a, b) => a.localeCompare(b));
+    
     for (const f of files) {
       await this.loadByPath(f);
     }
@@ -209,6 +235,29 @@ class PluginManager {
     lines.push('');
     return lines.join('\n');
   }
+
+
+
+/**
+ * List metas for loaded plugins (for dynamic help/UX).
+ * @returns {Array<any>}
+ */
+listPluginMetas() {
+  const metas = Array.from(this._loaded.values()).map((r) => r.meta);
+  metas.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  return metas;
+}
+
+/**
+ * Get meta for a loaded plugin by name.
+ * @param {string} name
+ * @returns {any|null}
+ */
+getPluginMeta(name) {
+  const n = String(name || '');
+  const rec = this._loaded.get(n);
+  return rec ? rec.meta : null;
+}
 
   _isPluginEnabled(name, meta) {
     const cfg = this.kernel && this.kernel.config ? this.kernel.config : {};

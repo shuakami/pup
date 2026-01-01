@@ -22,6 +22,10 @@ const { getBrowser } = require('../browser');
 const { withTimeout } = require('../utils/async');
 const { isRetryableError } = require('../utils/errors');
 
+
+// Shared allowlist to avoid allocating a Set on every CDPClient.enable() call.
+const NEEDS_ENABLE_DOMAINS = new Set(['Page', 'DOM', 'Runtime', 'Accessibility', 'Network', 'Log', 'Overlay', 'Emulation']);
+
 /**
  * Ultra-light EventBus:
  * - avoids EventEmitter overhead (symbols, max listeners, etc.)
@@ -155,14 +159,20 @@ class CDPClient {
     if (!d) return;
     if (this._enabled.has(d)) return;
 
-    // some domains do not require enable; keep allowlist
-    const needsEnable = new Set(['Page', 'DOM', 'Runtime', 'Accessibility', 'Network', 'Log', 'Overlay', 'Emulation']);
-    if (!needsEnable.has(d)) {
-      this._enabled.add(d);
-      return;
-    }
+    // some domains do not require enable; keep allowlist (shared)
 
-    const method = `${d}.enable`;
+
+    if (!NEEDS_ENABLE_DOMAINS.has(d)) {
+
+
+      this._enabled.add(d);
+
+
+      return;
+
+
+    }
+const method = `${d}.enable`;
     try {
       await this.send(method, {}, { timeoutMs: this._enableTimeoutMs, label: `enable:${d}` });
       this._enabled.add(d);
@@ -258,6 +268,18 @@ class Kernel {
 
     this._hotReloadWatcher = null;
     this._hotReloadDebounce = null;
+    
+    // 标签页内存警告标记（只提醒一次）
+    this._tabMemoryWarned = false;
+    
+    // 暴露工具函数给外部插件使用
+    this.utils = {
+      strings: require('../utils/strings'),
+      async: require('../utils/async'),
+      errors: require('../utils/errors'),
+      colors: require('../utils/colors'),
+      promisePool: require('../utils/promise-pool')
+    };
   }
 
   // ===========================
@@ -487,6 +509,21 @@ class Kernel {
    * @param {string} name
    * @param {any} ctx
    */
+
+
+/**
+ * Get detailed command info for help/introspection.
+ * @param {string} name
+ * @returns {{name:string, plugin:string, spec:any}|null}
+ */
+getCommandInfo(name) {
+  const cmd = String(name || '').trim().toLowerCase();
+  if (!cmd) return null;
+  const rec = this._commands.get(cmd);
+  if (!rec) return null;
+  return { name: cmd, plugin: rec.plugin, spec: rec.spec };
+}
+
   async runCommand(name, ctx = {}) {
     const cmd = String(name || '').trim().toLowerCase();
     const rec = this._commands.get(cmd);
@@ -506,7 +543,22 @@ class Kernel {
     };
 
     try {
-      return await rec.spec.handler(context);
+      const result = await rec.spec.handler(context);
+      
+      // 命令执行后检测标签页数量，超过20个提醒一次
+      if (!this._tabMemoryWarned && this._browser) {
+        try {
+          const pages = await this._browser.pages();
+          if (pages.length > 20) {
+            this._tabMemoryWarned = true;
+            if (result && typeof result === 'object') {
+              result._tabWarning = `[!] Memory warning: ${pages.length} tabs open. Consider closing unused tabs with 'closeothertabs' or 'closetab'.`;
+            }
+          }
+        } catch {}
+      }
+      
+      return result;
     } catch (e) {
       // If this looks retryable, emit event for plugins to respond.
       if (isRetryableError(e)) {

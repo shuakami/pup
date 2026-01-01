@@ -34,6 +34,34 @@ async function safeGetTitle(kernel) {
 }
 
 /**
+ * 规范化 URL 用于比较（忽略末尾斜杠差异）
+ * 例如: /video/BV123 和 /video/BV123/ 应该被视为相同
+ */
+function normalizeUrlForCompare(url) {
+  if (!url) return '';
+  // 移除末尾斜杠（但保留根路径的斜杠）
+  try {
+    const u = new URL(url);
+    // 只处理路径部分的末尾斜杠，保留查询参数和 hash
+    if (u.pathname.length > 1 && u.pathname.endsWith('/')) {
+      u.pathname = u.pathname.slice(0, -1);
+    }
+    return u.href;
+  } catch {
+    // 如果 URL 解析失败，简单移除末尾斜杠
+    return url.replace(/\/+$/, '') || url;
+  }
+}
+
+/**
+ * 检查 URL 是否已在重定向链中（忽略末尾斜杠差异）
+ */
+function isUrlInChain(chain, url) {
+  const normalizedUrl = normalizeUrlForCompare(url);
+  return chain.some(u => normalizeUrlForCompare(u) === normalizedUrl);
+}
+
+/**
  * 检测页面是否白屏
  * 返回 { isBlank, reason } 或 null（如果检测失败）
  */
@@ -48,34 +76,41 @@ async function detectBlankPage(kernel) {
       const bodyText = (body.innerText || '').trim();
       const bodyHtml = body.innerHTML || '';
       
-      // 检查可见元素数量
-      const visibleElements = Array.from(body.querySelectorAll('*')).filter(el => {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return style.display !== 'none' && 
-               style.visibility !== 'hidden' && 
-               rect.width > 0 && 
-               rect.height > 0;
-      });
-      
-      // 白屏判断条件：
-      // 1. body 文本内容少于 50 字符
-      // 2. 可见元素少于 5 个
-      // 3. HTML 内容少于 500 字符
-      const isBlank = bodyText.length < 50 && visibleElements.length < 5 && bodyHtml.length < 500;
-      
-      if (isBlank) {
-        return {
-          isBlank: true,
-          reason: 'empty_content',
-          details: {
-            textLength: bodyText.length,
-            htmlLength: bodyHtml.length,
-            visibleElements: visibleElements.length
-          }
-        };
-      }
-      
+
+// 检查可见元素数量（性能优化：计数到阈值后提前退出）
+const nodes = body.querySelectorAll('*');
+let visibleCount = 0;
+const needVisibleThreshold = 5;
+const earlyExitAt = needVisibleThreshold + 1;
+
+for (let i = 0; i < nodes.length; i++) {
+  const el = nodes[i];
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden') continue;
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) continue;
+  visibleCount += 1;
+  if (visibleCount >= earlyExitAt) break;
+}
+
+// 白屏判断条件：
+// 1. body 文本内容少于 50 字符
+// 2. 可见元素少于 5 个
+// 3. HTML 内容少于 500 字符
+const isBlank = bodyText.length < 50 && visibleCount < needVisibleThreshold && bodyHtml.length < 500;
+
+if (isBlank) {
+  return {
+    isBlank: true,
+    reason: 'empty_content',
+    details: {
+      textLength: bodyText.length,
+      htmlLength: bodyHtml.length,
+      visibleElements: visibleCount
+    }
+  };
+}
+
       // 检查是否只有错误信息
       const errorKeywords = ['error', 'blocked', 'denied', 'forbidden', '403', '404', '500', '502', '503'];
       const lowerText = bodyText.toLowerCase();
@@ -126,11 +161,83 @@ async function goto(kernel, url, { autoScan = false } = {}) {
   if (!targetUrl) throw new Error('GOTO: missing url');
 
   // 确保 CDP session 是针对当前页面的
-  await kernel.cdp({ forceNew: true });
+  const cdp = await kernel.cdp({ forceNew: true });
 
   let timedOut = false;
   let result = {};
   const initialUrl = targetUrl;
+  
+  // 使用 CDP 追踪重定向链
+  const redirectChain = [];
+  let mainFrameId = null;
+  let mainRequestId = null;
+  
+  // 启用 Network 域
+  await cdp.enable('Network');
+  await cdp.enable('Page');
+  
+  // 监听请求
+  const requestHandler = (params) => {
+    // 只追踪主框架的文档请求，且必须是导航请求
+    if (params.type === 'Document' && params.requestId) {
+      const reqUrl = params.request && params.request.url;
+      // 过滤掉非 HTTP(S) 请求和浏览器内部请求
+      if (reqUrl && 
+          (reqUrl.startsWith('http://') || reqUrl.startsWith('https://')) &&
+          !reqUrl.includes('browser.pipe.aria.microsoft.com') &&
+          !reqUrl.includes('chrome-extension://') &&
+          !reqUrl.includes('edge://')) {
+        
+        // 第一个请求设置 mainFrameId 和 mainRequestId
+        if (!mainFrameId) {
+          mainFrameId = params.frameId;
+          mainRequestId = params.requestId;
+        }
+        
+        // 只追踪主请求链（通过 requestId 或 redirectResponse 关联）
+        if (params.requestId === mainRequestId || 
+            (params.redirectResponse && redirectChain.length > 0)) {
+          // 使用 isUrlInChain 忽略末尾斜杠差异
+          if (!isUrlInChain(redirectChain, reqUrl)) {
+            redirectChain.push(reqUrl);
+          }
+          // 更新 mainRequestId 以追踪重定向链
+          mainRequestId = params.requestId;
+        }
+      }
+    }
+  };
+  
+  // 监听重定向响应
+  const redirectHandler = (params) => {
+    // 只处理有 redirectResponse 的请求（真正的 HTTP 重定向）
+    if (params.redirectResponse && params.requestId === mainRequestId) {
+      const redirUrl = params.redirectResponse.url;
+      const newUrl = params.request && params.request.url;
+      
+      // 确保重定向源 URL 在链中（使用 isUrlInChain 忽略末尾斜杠差异）
+      if (redirUrl && !isUrlInChain(redirectChain, redirUrl) &&
+          !redirUrl.includes('browser.pipe.aria.microsoft.com')) {
+        // 如果链为空或最后一个不是这个 URL（忽略末尾斜杠），添加它
+        if (redirectChain.length === 0 || normalizeUrlForCompare(redirectChain[redirectChain.length - 1]) !== normalizeUrlForCompare(redirUrl)) {
+          redirectChain.push(redirUrl);
+        }
+      }
+      
+      // 添加重定向目标 URL（使用 isUrlInChain 忽略末尾斜杠差异）
+      if (newUrl && !isUrlInChain(redirectChain, newUrl) &&
+          !newUrl.includes('browser.pipe.aria.microsoft.com') &&
+          (newUrl.startsWith('http://') || newUrl.startsWith('https://'))) {
+        redirectChain.push(newUrl);
+      }
+      
+      // 更新 mainRequestId
+      mainRequestId = params.requestId;
+    }
+  };
+  
+  cdp.on('Network.requestWillBeSent', requestHandler);
+  cdp.on('Network.requestWillBeSent', redirectHandler);
 
   try {
     await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: kernel.config.NAVIGATION_TIMEOUT_MS || 45000 });
@@ -138,11 +245,17 @@ async function goto(kernel, url, { autoScan = false } = {}) {
     const msg = (e && e.message) ? String(e.message) : String(e);
     if (msg.includes('timeout') || msg.includes('Timeout')) {
       timedOut = true;
-      // 超时了，但页面可能已经部分加载，尝试获取当前状态
     } else {
+      // 清理监听器
+      cdp.off('Network.requestWillBeSent', requestHandler);
+      cdp.off('Network.requestWillBeSent', redirectHandler);
       throw e;
     }
   }
+  
+  // 清理监听器
+  cdp.off('Network.requestWillBeSent', requestHandler);
+  cdp.off('Network.requestWillBeSent', redirectHandler);
 
   // 等待一小段时间检测二次跳转
   await sleep(300);
@@ -151,23 +264,33 @@ async function goto(kernel, url, { autoScan = false } = {}) {
   result.title = await safeGetTitle(kernel);
   result.url = toStr(page.url());
   
+  // 确保最终 URL 在链中（使用 isUrlInChain 忽略末尾斜杠差异）
+  if (result.url && !isUrlInChain(redirectChain, result.url)) {
+    redirectChain.push(result.url);
+  }
+  
+  // 如果有重定向链（超过1个URL），记录
+  if (redirectChain.length > 1) {
+    result.redirectChain = redirectChain;
+    result.hopCount = redirectChain.length;
+    result.redirected = true;
+  }
+  
   // 检测二次跳转（404跳转、重定向等）
   const finalUrl = result.url;
-  // 标准化 URL 比较（忽略末尾斜杠）
   const normalizeUrl = (u) => u.replace(/\/+$/, '').toLowerCase();
   if (normalizeUrl(finalUrl) !== normalizeUrl(initialUrl)) {
-    // 检查是否跳转到了不同的页面
     try {
       const initialHost = new URL(initialUrl).hostname;
       const finalHost = new URL(finalUrl).hostname;
       
-      // 如果域名完全不同，或者跳转到了首页
       if (initialHost !== finalHost) {
         result.redirected = true;
         result.redirectFrom = initialUrl;
         result.redirectReason = 'different_domain';
+        result.originalDomain = initialHost;
+        result.finalDomain = finalHost;
       } else {
-        // 检查是否跳转到首页（排除只是加了斜杠的情况）
         const finalPath = new URL(finalUrl).pathname;
         const initialPath = new URL(initialUrl).pathname;
         if ((finalPath === '/' || finalPath === '') && initialPath !== '/' && initialPath !== '') {
@@ -262,10 +385,21 @@ async function forward(kernel) {
   return { title: await safeGetTitle(kernel), url: toStr(page.url()) };
 }
 
-async function reload(kernel) {
+async function reload(kernel, { autoScan = false } = {}) {
   const page = await kernel.page();
   await page.reload({ waitUntil: 'domcontentloaded', timeout: kernel.config.NAVIGATION_TIMEOUT_MS || 45000 });
-  return { title: await safeGetTitle(kernel), url: toStr(page.url()) };
+  const result = { title: await safeGetTitle(kernel), url: toStr(page.url()) };
+  
+  if (autoScan) {
+    const s = scanner(kernel);
+    if (s) {
+      const scanRes = await s.scan();
+      result.elements = scanRes.elements;
+      result.elementCount = (scanRes.elements || []).length;
+    }
+  }
+  
+  return result;
 }
 
 async function scroll(kernel, direction) {
@@ -534,12 +668,13 @@ async function batchCommand(kernel, argv) {
     const parts = cmdLine.split(/\s+/).filter(Boolean);
     const cmd = String(parts[0] || '').toLowerCase();
     const args = parts.slice(1);
+    const startTime = Date.now();
 
     try {
       const res = await kernel.runCommand(cmd, { argv: args });
-      results.push({ cmd, ok: true, result: res });
+      results.push({ cmd, ok: true, result: res, duration: Date.now() - startTime });
     } catch (e) {
-      results.push({ cmd, ok: false, error: String(e && e.message ? e.message : e) });
+      results.push({ cmd, ok: false, error: String(e && e.message ? e.message : e), duration: Date.now() - startTime });
     }
 
     await sleep(80);
@@ -607,9 +742,15 @@ async function onLoad(kernel) {
 
   kernel.registerCommand(meta.name, {
     name: 'reload',
-    usage: 'reload',
+    usage: 'reload [--scan]',
     description: 'Reload page.',
-    handler: async () => ({ ok: true, cmd: 'RELOAD', ...(await reload(kernel)) })
+    cliOptions: [{ flags: '--scan', description: 'Auto scan after reload' }],
+    handler: async (ctx) => {
+      const argv = ctx.argv || [];
+      const autoScan = argv.includes('--scan');
+      const res = await reload(kernel, { autoScan });
+      return { ok: true, cmd: 'RELOAD', ...res };
+    }
   });
 
   kernel.registerCommand(meta.name, {
