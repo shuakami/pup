@@ -48,7 +48,7 @@ async function boot(pluginsDir, externalPluginsDirs = []) {
 
 async function main() {
   const rawArgs = process.argv.slice(2);
-  const binName = path.basename(process.argv[1] || 'pup');
+  const binName = 'pup';
   const pluginsDir = path.join(__dirname, 'plugins');
   
   // 外部插件目录: 当前目录/.pup 和 用户目录/.pup

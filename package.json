@@ -1,6 +1,6 @@
 {
   "name": "@sdjz/pup",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Browser automation for AI agents - AXTree scanning, stealth mode, plugin architecture",
   "main": "src/index.js",
   "bin": {
